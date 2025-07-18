@@ -112,8 +112,10 @@ st.markdown("""
 st.sidebar.title("Configuration")
 
 # URL Input
-url = st.sidebar.text_input("Server URL", placeholder="https://kind-brooms-brush.loca.lt", 
-                          help="Enter the server URL")
+password = st.sidebar.text_input("Server Password", placeholder="Password", 
+                          help="Enter the server password")
+
+url = f'https://{password}.ngrok-free.app'
 
 # Name and Location Inputs
 name = st.sidebar.text_input("Your Name", key="user_name", help="Enter your name")
