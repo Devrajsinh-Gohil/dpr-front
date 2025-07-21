@@ -17,6 +17,7 @@ import {
   X,
   Menu
 } from 'lucide-react';
+import Cookies from 'js-cookie';
 
 const AudioTranscriptionApp = () => {
   // State management
@@ -27,6 +28,7 @@ const AudioTranscriptionApp = () => {
     url: '',
     groqApiKey: '',
     availableSheets: [],
+    authorizedUsers: [], // Added to store list of authorized users
     credentialsLoaded: false
   });
   
@@ -42,6 +44,7 @@ const AudioTranscriptionApp = () => {
   const [sessionHistory, setSessionHistory] = useState([]);
   const [currentSessionId, setCurrentSessionId] = useState(null);
   const [expandedSessions, setExpandedSessions] = useState(new Set());
+  const [chatMessages, setChatMessages] = useState([]);
 
   const mediaRecorder = useRef(null);
   const audioChunks = useRef([]);
@@ -147,14 +150,9 @@ const AudioTranscriptionApp = () => {
   const saveConfiguration = async () => {
     console.log('[Config] Starting save configuration...');
     
-    // Validate required fields
-    if (!config.password || !config.name || !config.location) {
-      const missingFields = [];
-      if (!config.password) missingFields.push('password');
-      if (!config.name) missingFields.push('name');
-      if (!config.location) missingFields.push('location');
-      
-      const errorMsg = `Please fill in all required fields. Missing: ${missingFields.join(', ')}`;
+    // Only validate password initially
+    if (!config.password) {
+      const errorMsg = 'Please enter the server password';
       console.error('[Config] Validation failed:', errorMsg);
       showMessage('error', errorMsg);
       return;
@@ -289,6 +287,7 @@ const AudioTranscriptionApp = () => {
         url,
         groqApiKey: creds.GROQ_API_KEY || '',
         availableSheets: creds.AVAILABLE_SHEETS || [],
+        authorizedUsers: creds.AUTHRISED_USERS || [],
         credentialsLoaded: true
       };
       
@@ -314,7 +313,8 @@ const AudioTranscriptionApp = () => {
       
       console.log('[Config] Configuration saved successfully');
       showMessage('success', 'Credentials loaded successfully!');
-      setShowSettings(false);
+      // Don't close the modal yet - let user select their name
+      // setShowSettings(false);
     } catch (error) {
       console.error('[Config] Error in saveConfiguration:', {
         message: error.message,
@@ -409,49 +409,189 @@ const AudioTranscriptionApp = () => {
 
   // Submit to sheet
   const submitToSheet = async () => {
-    if (!selectedSheet || !config.name.trim() || !currentTranscription.trim()) {
-      showMessage('error', 'Missing required information');
+    // Validate required fields
+    if (!selectedSheet) {
+      showMessage('error', 'Please select a sheet');
+      return;
+    }
+    
+    if (!config.name || !config.location) {
+      showMessage('error', 'Please select a user from the dropdown');
+      return;
+    }
+    
+    if (!currentTranscription.trim()) {
+      showMessage('error', 'Please add some text to submit');
       return;
     }
 
     setIsUpdatingSheet(true);
+    let response = null;
+    let responseText = '';
 
     try {
-      const transcriptionList = currentTranscription
-      
+      // Prepare the payload according to the backend's expected format
       const payload = {
-        transcription: transcriptionList,
+        transcription: currentTranscription.trim(),
         sheet_name: selectedSheet,
         name: config.name.trim(),
         location: config.location.trim()
       };
 
-      const response = await fetch(`${config.url}/process`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (response.ok) {
-        showMessage('success', 'Sheet updated successfully!');
-        completeCurrentSession();
-        setCurrentTranscription('');
-      } else {
-        throw new Error('Server error');
+      console.group('=== Submit Debug Info ===');
+      console.log('Sending to:', `${config.url}/process`);
+      console.log('Payload:', JSON.stringify(payload, null, 2));
+      
+      const startTime = Date.now();
+      
+      try {
+        // Create URL with query parameters
+        const params = new URLSearchParams();
+        params.append('transcription', payload.transcription);
+        if (payload.sheet_name) params.append('sheet_name', payload.sheet_name);
+        if (payload.name) params.append('name', payload.name);
+        if (payload.location) params.append('location', payload.location);
+        
+        const url = new URL(`${config.url}/process?${params.toString()}`);
+        console.log('Request URL:', url.toString());
+        
+        response = await fetch(url, {
+          method: 'POST',
+          headers: { 
+            'ngrok-skip-browser-warning': 'true',
+            'Accept': 'application/json'
+          }
+        });
+        responseText = await response.text();
+      } catch (fetchError) {
+        console.error('=== FETCH ERROR ===');
+        console.error('Error details:', {
+          name: fetchError.name,
+          message: fetchError.message,
+          stack: fetchError.stack,
+          cause: fetchError.cause
+        });
+        throw fetchError;
       }
+
+      const responseTime = Date.now() - startTime;
+      
+      console.log('\n=== RESPONSE ===');
+      console.log(`Status: ${response.status} ${response.statusText}`);
+      console.log(`Time: ${responseTime}ms`);
+      console.log('Headers:', Object.fromEntries(response.headers.entries()));
+      console.log('Raw Response:', responseText);
+      
+      if (!response.ok) {
+        console.error('\n=== SERVER ERROR ===');
+        let errorData = null;
+        try {
+          errorData = responseText ? JSON.parse(responseText) : null;
+          console.error('Parsed error data:', errorData);
+        } catch (e) {
+          console.error('Could not parse error response as JSON');
+        }
+        
+        let errorMessage = `Server error: ${response.status} ${response.statusText}`;
+        if (errorData) {
+          if (errorData.detail) errorMessage = errorData.detail;
+          else if (errorData.message) errorMessage = errorData.message;
+          else if (typeof errorData === 'string') errorMessage = errorData;
+        } else if (responseText) {
+          errorMessage = responseText;
+        }
+        
+        throw new Error(errorMessage);
+      }
+      
+      // If we get here, the request was successful
+      let result = {};
+      try {
+        result = responseText ? JSON.parse(responseText) : {};
+        console.log('\n=== SUCCESS ===');
+        console.log('Parsed response:', result);
+        
+        // Add user message and bot response to chat
+        const userMessage = {
+          id: Date.now(),
+          role: 'user',
+          content: currentTranscription.trim(),
+          timestamp: new Date().toISOString()
+        };
+        
+        const botMessage = {
+          id: Date.now() + 1,
+          role: 'assistant',
+          content: result.conclusion || 'Processed successfully',
+          timestamp: new Date().toISOString()
+        };
+        
+        setChatMessages(prev => [...prev, userMessage, botMessage]);
+        
+      } catch (e) {
+        console.error('\n=== RESPONSE PARSING ERROR ===');
+        console.error('Could not parse response as JSON');
+        console.error('Response text:', responseText);
+        throw new Error('Received invalid JSON response from server');
+      }
+      
+      showMessage('success', 'Processed successfully!');
+      completeCurrentSession();
+      setCurrentTranscription('');
+      
     } catch (error) {
-      showMessage('error', 'Failed to update sheet');
+      console.error('\n=== UNHANDLED ERROR ===');
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        cause: error.cause,
+        responseStatus: response?.status,
+        responseStatusText: response?.statusText,
+        responseText: responseText
+      });
+      
+      // More user-friendly error message
+      let userMessage = 'An error occurred while updating the sheet.';
+      
+      if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+        userMessage = 'Failed to connect to the server. Please check your internet connection and try again.';
+      } else if (error.message.includes('SyntaxError')) {
+        userMessage = 'Received an invalid response from the server. Please try again.';
+      } else if (error.message) {
+        userMessage = error.message;
+      }
+      
+      showMessage('error', userMessage);
     } finally {
+      console.groupEnd();
       setIsUpdatingSheet(false);
     }
   };
 
-  // Initialize with first session on mount
+  // Initialize with first session and load chat messages from cookies
   useEffect(() => {
     if (sessionHistory.length === 0) {
       createNewSession();
     }
+    
+    // Load chat messages from cookies
+    const savedMessages = Cookies.get('chatMessages');
+    if (savedMessages) {
+      try {
+        setChatMessages(JSON.parse(savedMessages));
+      } catch (error) {
+        console.error('Error parsing chat messages from cookies:', error);
+      }
+    }
   }, []);
+  
+  // Save chat messages to cookies whenever they change
+  useEffect(() => {
+    if (chatMessages.length > 0) {
+      Cookies.set('chatMessages', JSON.stringify(chatMessages), { expires: 7 }); // Expires in 7 days
+    }
+  }, [chatMessages]);
 
   // Handle window resize for sidebar behavior
   useEffect(() => {
@@ -648,14 +788,49 @@ const AudioTranscriptionApp = () => {
                 </div>
               )}
 
-              {/* Transcription Area */}
+              {/* Chat Messages */}
+              <div className="mb-4 space-y-4 max-h-[300px] overflow-y-auto p-2 -mx-2">
+                {chatMessages.map((msg) => (
+                  <div 
+                    key={msg.id}
+                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div 
+                      className={`max-w-[80%] p-3 rounded-lg ${
+                        msg.role === 'user' 
+                          ? 'bg-blue-500 text-black rounded-br-none' 
+                          : 'bg-gray-100 text-gray-800 rounded-bl-none'
+                      }`}
+                    >
+                      <p className="whitespace-pre-line">{msg.content}</p>
+                      <p className="text-xs opacity-70 mt-1">
+                        {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+                
+                {/* Current transcription preview */}
+                {currentTranscription && (
+                  <div className="flex justify-end">
+                    <div className="max-w-[80%] p-3 rounded-lg bg-blue-500 text-white rounded-br-none opacity-80">
+                      <p className="whitespace-pre-line">{currentTranscription}</p>
+                      <p className="text-xs opacity-70 mt-1">
+                        {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Transcription Input Area */}
               <div className="relative">
                 <div className="bg-white border border-gray-200 rounded-lg shadow-sm min-h-[160px] relative">
                   <textarea
                     value={currentTranscription}
                     onChange={(e) => setCurrentTranscription(e.target.value)}
-                    className="w-full h-48 md:h-64 p-4 md:p-6 border-none bg-transparent rounded-lg resize-none focus:outline-none text-base leading-relaxed text-black placeholder-gray-500"
-                    placeholder="Your transcription will appear here..."
+                    className="w-full h-48 md:h-40 p-4 md:p-6 border-none bg-transparent rounded-lg resize-none focus:outline-none text-base leading-relaxed text-black placeholder-gray-500"
+                    placeholder="Type your message or use voice input..."
                   />
                   
                   {/* Bottom Controls */}
@@ -668,12 +843,6 @@ const AudioTranscriptionApp = () => {
                         title="Clear transcription"
                       >
                         <X size={16} className="text-gray-600" />
-                      </button>
-                      
-                      {/* Tools button */}
-                      <button className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-gray-300 hover:bg-gray-50 transition-colors text-sm text-gray-600">
-                        <Settings size={14} />
-                        <span>Tools</span>
                       </button>
                     </div>
 
@@ -758,50 +927,113 @@ const AudioTranscriptionApp = () => {
               </div>
             </div>
             
-            <div className="p-4 md:p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Server Password
-                </label>
-                <input
-                  type="password"
-                  value={config.password}
-                  onChange={(e) => setConfig(prev => ({ ...prev, password: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-base text-black"
-                />
-              </div>
+            <form 
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveConfiguration();
+              }}
+              className="p-4 md:p-6 space-y-4"
+            >
+              {!config.credentialsLoaded ? (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Server Password
+                  </label>
+                  <div className="flex space-x-2">
+                    <input
+                      type="password"
+                      value={config.password}
+                      onChange={(e) => setConfig(prev => ({ ...prev, password: e.target.value }))}
+                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-base text-black"
+                      placeholder="Enter server password"
+                      required
+                    />
+                    <button
+                      type="submit"
+                      className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                    >
+                      Connect
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Select User
+                    </label>
+                    <select
+                      value={config.name && config.location ? `${config.name}||${config.location}` : ''}
+                      onChange={(e) => {
+                        const [name, location] = e.target.value.split('||');
+                        setConfig(prev => ({
+                          ...prev,
+                          name: name || '',
+                          location: location || ''
+                        }));
+                      }}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-base text-black bg-white"
+                      disabled={!config.credentialsLoaded}
+                    >
+                      <option value="">Select a user</option>
+                      {config.authorizedUsers.map((user, index) => (
+                        <option 
+                          key={index} 
+                          value={`${user.name}||${user.location}`}
+                        >
+                          {user.name} - {user.location}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  
+                  {config.name && config.location && (
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          Your Name
+                        </label>
+                        <input
+                          type="text"
+                          value={config.name}
+                          readOnly
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-base text-gray-700"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          Location
+                        </label>
+                        <input
+                          type="text"
+                          value={config.location}
+                          readOnly
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-base text-gray-700"
+                        />
+                      </div>
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowSettings(false)}
+                          className="w-full bg-green-600 hover:bg-green-700 text-white py-2 px-4 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
+                        >
+                          Done
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Your Name
-                </label>
-                <input
-                  type="text"
-                  value={config.name}
-                  onChange={(e) => setConfig(prev => ({ ...prev, name: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-base text-black"
-                />
+              <div className="mt-6">
+                <button
+                  type="submit"
+                  className="w-full bg-gray-800 hover:bg-gray-900 active:bg-gray-800 text-white py-2.5 px-4 rounded-md transition-colors touch-manipulation text-sm font-medium"
+                >
+                  Save Configuration
+                </button>
               </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Location
-                </label>
-                <input
-                  type="text"
-                  value={config.location}
-                  onChange={(e) => setConfig(prev => ({ ...prev, location: e.target.value }))}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-base text-black"
-                />
-              </div>
-
-              <button
-                onClick={saveConfiguration}
-                className="w-full bg-gray-800 hover:bg-gray-900 active:bg-gray-800 text-white py-2.5 px-4 rounded-md transition-colors touch-manipulation text-sm font-medium"
-              >
-                Save Configuration
-              </button>
-            </div>
+            </form>
           </div>
         </div>
       )}

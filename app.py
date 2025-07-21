@@ -121,6 +121,17 @@ url = f'https://{password}.ngrok-free.app'
 name = st.sidebar.text_input("Your Name", key="user_name", help="Enter your name")
 location = st.sidebar.text_input("Location", key="user_location", help="Enter your site location")
 
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # For development only, restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Save Button
 if st.sidebar.button("Save & Get Credentials"):
     if not url or not name or not location:
