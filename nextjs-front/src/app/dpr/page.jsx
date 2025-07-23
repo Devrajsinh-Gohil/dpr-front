@@ -5,15 +5,11 @@ import {
   Mic, 
   MicOff, 
   Send, 
-  Trash2, 
   Settings, 
   Plus,
   MessageSquare,
   Clock,
-  ChevronDown,
-  ChevronRight,
   User,
-  Bot,
   X,
   Menu
 } from 'lucide-react';
@@ -146,9 +142,46 @@ const AudioTranscriptionApp = () => {
     setTimeout(() => setMessage({ type: '', text: '' }), 5000);
   };
 
+  // Save config to session storage
+  const saveConfigToSession = (config) => {
+    if (typeof window !== 'undefined') {
+      sessionStorage.setItem('appConfig', JSON.stringify({
+        ...config,
+        // Don't store sensitive data
+        password: '',
+        groqApiKey: ''
+      }));
+    }
+  };
+
+  // Load config from session storage
+  const loadConfigFromSession = () => {
+    if (typeof window !== 'undefined') {
+      const savedConfig = sessionStorage.getItem('appConfig');
+      if (savedConfig) {
+        const parsed = JSON.parse(savedConfig);
+        setConfig(prev => ({
+          ...prev,
+          ...parsed,
+          // Keep sensitive data from current state
+          password: prev.password,
+          groqApiKey: prev.groqApiKey
+        }));
+        return true;
+      }
+    }
+    return false;
+  };
+
   // Save configuration and get credentials
   const saveConfiguration = async () => {
     console.log('[Config] Starting save configuration...');
+    
+    // Don't proceed if we already have credentials loaded
+    if (config.credentialsLoaded) {
+      setShowSettings(false);
+      return;
+    }
     
     // Only validate password initially
     if (!config.password) {
@@ -292,10 +325,16 @@ const AudioTranscriptionApp = () => {
       };
       
       console.log('[Config] Updating configuration...');
-      setConfig(prev => ({
-        ...prev,
+      const newConfig = {
+        ...config,
         ...updatedConfig
-      }));
+      };
+      
+      // Save to state
+      setConfig(newConfig);
+      
+      // Persist to session storage
+      saveConfigToSession(newConfig);
       
       const validSheets = (creds.AVAILABLE_SHEETS || []).filter(
         sheet => sheet && typeof sheet === 'string' && sheet.toUpperCase() !== 'LOGS'
@@ -349,10 +388,24 @@ const AudioTranscriptionApp = () => {
         audioChunks.current.push(event.data);
       };
 
-      mediaRecorder.current.onstop = () => {
+      mediaRecorder.current.onstop = async () => {
         const audioBlob = new Blob(audioChunks.current, { type: 'audio/wav' });
-        setAudioBlob(audioBlob);
         stream.getTracks().forEach(track => track.stop());
+        
+        // Auto-start transcription when recording stops
+        try {
+          setIsTranscribing(true);
+          const transcription = await transcribeAudio(audioBlob);
+          if (transcription) {
+            // Only update the text box, don't send to chat
+            setCurrentTranscription(prev => prev ? `${prev}\n\n${transcription}` : transcription);
+          }
+        } catch (error) {
+          console.error('Auto-transcription failed:', error);
+          showMessage('error', 'Transcription failed');
+        } finally {
+          setIsTranscribing(false);
+        }
       };
 
       mediaRecorder.current.start();
@@ -369,15 +422,14 @@ const AudioTranscriptionApp = () => {
     }
   };
 
-  // Transcribe audio
-  const transcribeAudio = async () => {
-    if (!audioBlob || !config.groqApiKey) return;
-
-    setIsTranscribing(true);
+  // Transcribe audio and return the transcription text
+  const transcribeAudio = async (audioBlobToTranscribe) => {
+    const blob = audioBlobToTranscribe;
+    if (!blob || !config.groqApiKey) return '';
     
     try {
       const formData = new FormData();
-      formData.append('file', audioBlob, 'audio.wav');
+      formData.append('file', blob, 'audio.wav');
       formData.append('model', 'whisper-large-v3-turbo');
       formData.append('response_format', 'json');
 
@@ -389,21 +441,14 @@ const AudioTranscriptionApp = () => {
 
       if (response.ok) {
         const result = await response.json();
-        const transcription = result.text?.trim();
-        
-        if (transcription) {
-          const newText = currentTranscription 
-            ? `${currentTranscription}\n\n${transcription}`
-            : transcription;
-          setCurrentTranscription(newText);
-          addToCurrentSession(transcription);
-          setAudioBlob(null);
-        }
+        return result.text?.trim() || '';
+      } else {
+        throw new Error('Transcription failed');
       }
     } catch (error) {
-      showMessage('error', 'Transcription failed');
-    } finally {
-      setIsTranscribing(false);
+      console.error('Error transcribing audio:', error);
+      showMessage('error', 'Failed to transcribe audio');
+      throw error;
     }
   };
 
@@ -522,7 +567,7 @@ const AudioTranscriptionApp = () => {
         const botMessage = {
           id: Date.now() + 1,
           role: 'assistant',
-          content: result.conclusion || 'Processed successfully',
+          content: (result?.conclution || result || responseText || 'Action completed'),
           timestamp: new Date().toISOString()
         };
         
@@ -535,7 +580,7 @@ const AudioTranscriptionApp = () => {
         throw new Error('Received invalid JSON response from server');
       }
       
-      showMessage('success', 'Processed successfully!');
+      showMessage('success', (result?.conclution || result || responseText || 'Action completed successfully!'));
       completeCurrentSession();
       setCurrentTranscription('');
       
@@ -570,12 +615,12 @@ const AudioTranscriptionApp = () => {
   };
 
   // Initialize with first session and load chat messages from cookies
+  // Load config and messages on mount
   useEffect(() => {
-    if (sessionHistory.length === 0) {
-      createNewSession();
-    }
+    // Try to load config from session storage
+    const wasConfigured = loadConfigFromSession();
     
-    // Load chat messages from cookies
+    // Load chat messages if we have any
     const savedMessages = Cookies.get('chatMessages');
     if (savedMessages) {
       try {
@@ -584,14 +629,28 @@ const AudioTranscriptionApp = () => {
         console.error('Error parsing chat messages from cookies:', error);
       }
     }
+    
+    // Create a new session if needed
+    if (sessionHistory.length === 0) {
+      createNewSession();
+    }
   }, []);
-  
+
   // Save chat messages to cookies whenever they change
   useEffect(() => {
     if (chatMessages.length > 0) {
-      Cookies.set('chatMessages', JSON.stringify(chatMessages), { expires: 7 }); // Expires in 7 days
+      Cookies.set('chatMessages', JSON.stringify(chatMessages), { expires: 7 });
+    } else {
+      Cookies.remove('chatMessages');
     }
   }, [chatMessages]);
+  
+  // Save config to session storage when it changes
+  useEffect(() => {
+    if (config.credentialsLoaded) {
+      saveConfigToSession(config);
+    }
+  }, [config]);
 
   // Handle window resize for sidebar behavior
   useEffect(() => {
@@ -625,6 +684,16 @@ const AudioTranscriptionApp = () => {
   );
 
   const currentSession = sessionHistory.find(s => s.id === currentSessionId);
+
+  // Group sessions by date
+  const sessionsByDate = sessionHistory.reduce((groups, session) => {
+    const date = new Date(session.timestamp).toDateString();
+    if (!groups[date]) {
+      groups[date] = [];
+    }
+    groups[date].unshift(session); // Add newest first
+    return groups;
+  }, {});
 
   return (
     <div className="flex h-screen bg-gray-50 overflow-hidden">
@@ -669,30 +738,39 @@ const AudioTranscriptionApp = () => {
               Recent chats
             </h3>
             
-            {sessionHistory.map((session) => (
-              <div key={session.id} className="mb-1">
-                <button
-                  onClick={() => loadSession(session.id)}
-                  className={`w-full text-left px-2 md:px-3 py-2.5 rounded-md text-sm transition-colors hover:bg-gray-100 ${
-                    currentSessionId === session.id ? 'bg-gray-100' : ''
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    <MessageSquare size={14} className="text-gray-500 flex-shrink-0" />
-                    <div className="flex-1 min-w-0">
-                      <div className="truncate text-xs md:text-sm">{session.title}</div>
-                      <div className="text-xs text-gray-500 flex items-center gap-1 mt-1">
-                        <Clock size={10} />
-                        <span className="text-xs">{session.timestamp.toLocaleDateString()}</span>
-                        {session.isCompleted && (
-                          <span className="ml-1 px-1.5 py-0.5 bg-green-100 text-green-800 text-xs rounded">
-                            Done
-                          </span>
-                        )}
+            {Object.entries(sessionsByDate).map(([date, sessions]) => (
+              <div key={date} className="mb-4">
+                <div className="px-2 py-1 text-xs font-medium text-gray-500">
+                  {date}
+                </div>
+                {sessions.map((session) => (
+                  <div key={session.id} className="mb-1">
+                    <button
+                      onClick={() => loadSession(session.id)}
+                      className={`w-full text-left px-2 md:px-3 py-2.5 rounded-md text-sm transition-colors hover:bg-gray-100 ${
+                        currentSessionId === session.id ? 'bg-gray-100' : ''
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <MessageSquare size={14} className="text-gray-500 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="truncate text-xs md:text-sm">{session.title}</div>
+                          <div className="text-xs text-gray-500 flex items-center gap-1 mt-1">
+                            <Clock size={10} />
+                            <span className="text-xs">
+                              {new Date(session.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                            </span>
+                            {session.isCompleted && (
+                              <span className="ml-1 px-1.5 py-0.5 bg-green-100 text-green-800 text-xs rounded">
+                                Done
+                              </span>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                    </div>
+                    </button>
                   </div>
-                </button>
+                ))}
               </div>
             ))}
           </div>
@@ -798,7 +876,7 @@ const AudioTranscriptionApp = () => {
                     <div 
                       className={`max-w-[80%] p-3 rounded-lg ${
                         msg.role === 'user' 
-                          ? 'bg-blue-500 text-black rounded-br-none' 
+                          ? 'bg-gray-200 text-black rounded-br-none' 
                           : 'bg-gray-100 text-gray-800 rounded-bl-none'
                       }`}
                     >
@@ -809,18 +887,6 @@ const AudioTranscriptionApp = () => {
                     </div>
                   </div>
                 ))}
-                
-                {/* Current transcription preview */}
-                {currentTranscription && (
-                  <div className="flex justify-end">
-                    <div className="max-w-[80%] p-3 rounded-lg bg-blue-500 text-white rounded-br-none opacity-80">
-                      <p className="whitespace-pre-line">{currentTranscription}</p>
-                      <p className="text-xs opacity-70 mt-1">
-                        {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </p>
-                    </div>
-                  </div>
-                )}
               </div>
 
               {/* Transcription Input Area */}
@@ -876,35 +942,6 @@ const AudioTranscriptionApp = () => {
                     </div>
                   </div>
                 </div>
-
-                {/* Audio transcription controls when audio is ready */}
-                {audioBlob && (
-                  <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <audio
-                          src={URL.createObjectURL(audioBlob)}
-                          controls
-                          className="h-8"
-                        />
-                      </div>
-                      <button
-                        onClick={transcribeAudio}
-                        disabled={isTranscribing}
-                        className="bg-gray-800 hover:bg-gray-900 active:bg-gray-800 disabled:bg-gray-300 text-white px-4 py-2 rounded-md transition-colors flex items-center gap-2 text-sm touch-manipulation"
-                      >
-                        {isTranscribing ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
-                            Transcribing...
-                          </>
-                        ) : (
-                          'Transcribe'
-                        )}
-                      </button>
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
           )}
