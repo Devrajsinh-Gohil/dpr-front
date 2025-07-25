@@ -45,23 +45,87 @@ const AudioTranscriptionApp = () => {
   const mediaRecorder = useRef(null);
   const audioChunks = useRef([]);
 
+  // Save session history to localStorage, scoped by user
+  const saveSessionHistory = (sessions, username) => {
+    if (typeof window !== 'undefined' && username) {
+      localStorage.setItem(`sessionHistory_${username}`, JSON.stringify(sessions));
+    }
+  };
+
+  // Load session history from localStorage, scoped by user
+  const loadSessionHistory = async (username) => {
+    if (typeof window !== 'undefined' && username) {
+      try {
+        const savedSessions = localStorage.getItem(`sessionHistory_${username}`);
+        if (savedSessions) {
+          const parsedSessions = JSON.parse(savedSessions);
+          // Ensure each session has a dateKey for backward compatibility
+          const sessionsWithDateKey = parsedSessions.map(session => ({
+            ...session,
+            // Convert timestamp to Date object if it's a string
+            timestamp: typeof session.timestamp === 'string' ? new Date(session.timestamp) : session.timestamp,
+            dateKey: session.dateKey || (session.timestamp ? new Date(session.timestamp).toDateString() : new Date().toDateString())
+          }));
+          
+          // Sort sessions by timestamp (newest first)
+          sessionsWithDateKey.sort((a, b) => b.timestamp - a.timestamp);
+          
+          // Return the loaded sessions first, then update state
+          return sessionsWithDateKey;
+        }
+      } catch (error) {
+        console.error('Error parsing session history:', error);
+      }
+    }
+    // Return empty array if no sessions found or on error
+    return [];
+  };
+
   // Create new session
   const createNewSession = () => {
+    if (!config.name) return null;
+    
+    const now = new Date();
+    const today = now.toDateString();
+    
+    // Check if a session already exists for today
+    const existingSession = sessionHistory.find(
+      session => new Date(session.timestamp).toDateString() === today
+    );
+    
+    if (existingSession) {
+      // If a session for today already exists, return it instead of creating a new one
+      setCurrentSessionId(existingSession.id);
+      return existingSession;
+    }
+    
     const newSession = {
       id: Date.now(),
-      title: 'New Transcription',
-      timestamp: new Date(),
+      title: `Chat - ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`,
+      timestamp: now,
       transcriptions: [],
-      isCompleted: false
+      isCompleted: false,
+      dateKey: today,
+      username: config.name // Associate session with current user
     };
     
-    setSessionHistory(prev => [newSession, ...prev]);
+    setSessionHistory(prev => {
+      const updatedSessions = [newSession, ...prev];
+      saveSessionHistory(updatedSessions, config.name);
+      return updatedSessions;
+    });
+    
     setCurrentSessionId(newSession.id);
     setCurrentTranscription('');
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
+    
+    return newSession;
   };
+  
+  // This function is no longer needed as we've moved its logic to the main effect
+  // to ensure proper sequencing of operations
 
   // Update session title based on first transcription
   const updateSessionTitle = (sessionId, firstTranscription) => {
@@ -69,13 +133,19 @@ const AudioTranscriptionApp = () => {
       ? firstTranscription.substring(0, 50) + '...'
       : firstTranscription;
     
-    setSessionHistory(prev => 
-      prev.map(session => 
+    setSessionHistory(prev => {
+      const updatedSessions = prev.map(session => 
         session.id === sessionId 
           ? { ...session, title }
           : session
-      )
-    );
+      );
+      
+      if (config.name) {
+        saveSessionHistory(updatedSessions, config.name);
+      }
+      
+      return updatedSessions;
+    });
   };
 
   // Add transcription to current session
@@ -159,15 +229,33 @@ const AudioTranscriptionApp = () => {
     if (typeof window !== 'undefined') {
       const savedConfig = sessionStorage.getItem('appConfig');
       if (savedConfig) {
-        const parsed = JSON.parse(savedConfig);
-        setConfig(prev => ({
-          ...prev,
-          ...parsed,
-          // Keep sensitive data from current state
-          password: prev.password,
-          groqApiKey: prev.groqApiKey
-        }));
-        return true;
+        try {
+          const parsed = JSON.parse(savedConfig);
+          // Only update if we have actual changes to prevent unnecessary re-renders
+          setConfig(prev => {
+            // Check if the loaded config is different from current
+            const hasChanges = Object.keys(parsed).some(key => {
+              // Skip sensitive fields that we don't want to overwrite
+              if (key === 'password' || key === 'groqApiKey') return false;
+              return JSON.stringify(prev[key]) !== JSON.stringify(parsed[key]);
+            });
+            
+            if (hasChanges) {
+              return {
+                ...prev,
+                ...parsed,
+                // Keep sensitive data from current state
+                password: prev.password,
+                groqApiKey: prev.groqApiKey
+              };
+            }
+            return prev;
+          });
+          return true;
+        } catch (error) {
+          console.error('Error parsing saved config:', error);
+          return false;
+        }
       }
     }
     return false;
@@ -556,21 +644,24 @@ const AudioTranscriptionApp = () => {
         console.log('\n=== SUCCESS ===');
         console.log('Parsed response:', result);
         
-        // Add user message and bot response to chat
+        // Add user message and bot response to chat with user info
         const userMessage = {
           id: Date.now(),
           role: 'user',
           content: currentTranscription.trim(),
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          user: config.name // Add user info to message
         };
         
         const botMessage = {
           id: Date.now() + 1,
           role: 'assistant',
           content: (result?.conclution || result || responseText || 'Action completed'),
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          user: config.name // Add user info to bot message
         };
         
+        // Only keep messages for the current user in state
         setChatMessages(prev => [...prev, userMessage, botMessage]);
         
       } catch (e) {
@@ -614,37 +705,136 @@ const AudioTranscriptionApp = () => {
     }
   };
 
-  // Initialize with first session and load chat messages from cookies
-  // Load config and messages on mount
+  // Track initialization state
+  const initializedRef = useRef(false);
+  
+  // Load config and session history on mount and when config.name changes
   useEffect(() => {
-    // Try to load config from session storage
-    const wasConfigured = loadConfigFromSession();
+    // Skip if already initialized or no user
+    if (initializedRef.current || !config.name) return;
     
-    // Load chat messages if we have any
-    const savedMessages = Cookies.get('chatMessages');
-    if (savedMessages) {
+    let isMounted = true;
+    initializedRef.current = true;
+    
+    const loadAndInitializeSessions = async () => {
       try {
-        setChatMessages(JSON.parse(savedMessages));
+        // 1. Load session history for the current user
+        const loadedSessions = await loadSessionHistory(config.name);
+        
+        if (!isMounted) return;
+        
+        // 2. Find today's session
+        const today = new Date().toDateString();
+        const todaysSession = loadedSessions.find(
+          session => new Date(session.timestamp).toDateString() === today
+        );
+        
+        // 3. Update state in a single batch
+        if (loadedSessions.length > 0) {
+          setSessionHistory(loadedSessions);
+          
+          if (todaysSession) {
+            setCurrentSessionId(todaysSession.id);
+          } else if (loadedSessions.length > 0) {
+            // Create new session only if we have sessions but none for today
+            createNewSession();
+          }
+        } else {
+          // No sessions exist for this user
+          createNewSession();
+        }
       } catch (error) {
-        console.error('Error parsing chat messages from cookies:', error);
+        console.error('Failed to initialize sessions:', error);
+      }
+    };
+    
+    loadAndInitializeSessions();
+    
+    // Set up interval for daily check (every hour)
+    const intervalId = setInterval(() => {
+      if (isMounted && config.name) {
+        const today = new Date().toDateString();
+        const hasTodaysSession = sessionHistory.some(
+          session => new Date(session.timestamp).toDateString() === today
+        );
+        
+        if (!hasTodaysSession) {
+          createNewSession();
+        }
+      }
+    }, 60 * 60 * 1000);
+    
+    // Cleanup
+    return () => {
+      isMounted = false;
+      clearInterval(intervalId);
+    };
+  }, [config.name, sessionHistory]);
+  
+  // Load config on mount
+  useEffect(() => {
+    loadConfigFromSession();
+  }, []);
+  
+  // This effect is no longer needed as we've moved its logic to the main effect
+  // to ensure proper sequencing of operations
+  
+  // Load chat messages when config.name changes
+  useEffect(() => {
+    if (config.name) {
+      const savedMessages = Cookies.get(`chatMessages_${config.name}`);
+      if (savedMessages) {
+        try {
+          const parsedMessages = JSON.parse(savedMessages);
+          // Only set messages if we don't have any yet (to prevent overwriting)
+          setChatMessages(prev => prev.length === 0 ? parsedMessages : prev);
+        } catch (error) {
+          console.error('Error parsing chat messages from cookies:', error);
+        }
       }
     }
-    
-    // Create a new session if needed
-    if (sessionHistory.length === 0) {
-      createNewSession();
-    }
-  }, []);
+  }, [config.name]);
 
-  // Save chat messages to cookies whenever they change
+  // Save chat messages to cookies whenever they change, scoped by user
   useEffect(() => {
-    if (chatMessages.length > 0) {
-      Cookies.set('chatMessages', JSON.stringify(chatMessages), { expires: 7 });
-    } else {
-      Cookies.remove('chatMessages');
+    if (config.name && chatMessages.length > 0) {
+      // Always include all messages in the cookie, not just the current user's
+      // This way we don't lose messages if the user changes
+      Cookies.set(`chatMessages_${config.name}`, JSON.stringify(chatMessages), { 
+        expires: 7,
+        sameSite: 'strict',
+        secure: process.env.NODE_ENV === 'production'
+      });
     }
-  }, [chatMessages]);
+  }, [chatMessages, config.name]);
   
+  // Handle logout
+  const handleLogout = () => {
+    // Clear session storage
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem('appConfig');
+    }
+    
+    // Reset config to initial state
+    setConfig({
+      password: '',
+      name: '',
+      location: '',
+      url: '',
+      groqApiKey: '',
+      availableSheets: [],
+      authorizedUsers: [],
+      credentialsLoaded: false
+    });
+    
+    // Clear current chat and sessions
+    setChatMessages([]);
+    setSessionHistory([]);
+    setCurrentSessionId(null);
+    setShowSettings(true);
+    showMessage('info', 'You have been logged out. Please enter a new password.');
+  };
+
   // Save config to session storage when it changes
   useEffect(() => {
     if (config.credentialsLoaded) {
@@ -720,15 +910,9 @@ const AudioTranscriptionApp = () => {
         flex flex-col
         shadow-sm
       `}>
-        {/* Sidebar Header */}
+        {/* Sidebar Header - New Chat Button Removed */}
         <div className="p-3 md:p-4 border-b border-gray-200">
-          <button
-            onClick={createNewSession}
-            className="w-full flex items-center gap-2 md:gap-3 px-2 md:px-3 py-2.5 bg-white hover:bg-gray-50 border border-gray-200 rounded-md transition-colors text-sm text-gray-800 font-medium"
-          >
-            <Plus size={16} className="text-gray-600" />
-            New chat
-          </button>
+          {/* New chat button has been removed */}
         </div>
 
         {/* History */}
@@ -845,12 +1029,24 @@ const AudioTranscriptionApp = () => {
                 <p className="text-gray-500 mb-6 text-sm md:text-base">
                   Configure your settings to start updating DPR
                 </p>
-                <button
-                  onClick={() => setShowSettings(true)}
-                  className="bg-gray-800 hover:bg-gray-900 text-white px-6 py-2.5 rounded-md transition-colors text-sm font-medium"
-                >
-                  Get Started
-                </button>
+                <div className="flex justify-center">
+                  <div className="flex flex-col items-center space-y-3 w-full max-w-xs">
+                    <button
+                      onClick={() => setShowSettings(true)}
+                      className="w-full bg-black hover:bg-gray-800 text-white px-6 py-2.5 rounded-md transition-colors text-sm font-medium"
+                    >
+                      Configure Settings
+                    </button>
+                    {config.credentialsLoaded && (
+                      <button
+                        onClick={handleLogout}
+                        className="w-full bg-gray-600 hover:bg-gray-700 text-white px-6 py-2.5 rounded-md transition-colors text-sm font-medium"
+                      >
+                        Logout
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           ) : (
@@ -868,7 +1064,9 @@ const AudioTranscriptionApp = () => {
 
               {/* Chat Messages */}
               <div className="mb-4 space-y-4 max-h-[300px] overflow-y-auto p-2 -mx-2">
-                {chatMessages.map((msg) => (
+                {chatMessages
+                .filter(msg => msg.user === config.name) // Only show messages for current user
+                .map((msg) => (
                   <div 
                     key={msg.id}
                     className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
@@ -1048,28 +1246,26 @@ const AudioTranscriptionApp = () => {
                           className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100 text-base text-gray-700"
                         />
                       </div>
-                      <div className="pt-2">
+                      <div className="pt-2 space-y-3">
                         <button
                           type="button"
-                          onClick={() => setShowSettings(false)}
-                          className="w-full bg-green-600 hover:bg-green-700 text-white py-2 px-4 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
+                          onClick={saveConfiguration}
+                          className="w-full px-4 py-2 bg-white text-black border border-black rounded-md hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition-colors"
                         >
-                          Done
+                          Save Configuration
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleLogout}
+                          className="w-full px-4 py-2 bg-black text-white rounded-md hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition-colors"
+                        >
+                          Logout
                         </button>
                       </div>
                     </div>
                   )}
                 </div>
               )}
-
-              <div className="mt-6">
-                <button
-                  type="submit"
-                  className="w-full bg-gray-800 hover:bg-gray-900 active:bg-gray-800 text-white py-2.5 px-4 rounded-md transition-colors touch-manipulation text-sm font-medium"
-                >
-                  Save Configuration
-                </button>
-              </div>
             </form>
           </div>
         </div>
